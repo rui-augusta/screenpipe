@@ -25,17 +25,15 @@ fn has_transcribable_audio(audio: &[f32]) -> Result<bool> {
     }
 
     // Quiet speech and room noise share the same RMS range. Use the existing
-    // local WebRTC detector rather than discarding both or amplifying noise
-    // into Whisper. Gain is used for detection only, never for the recording.
+    // local WebRTC detector rather than discarding both or amplifying noise.
     let mut vad = webrtc_vad::Vad::new_with_rate(webrtc_vad::SampleRate::Rate16kHz);
     vad.set_mode(webrtc_vad::VadMode::Aggressive);
-    let gain = (0.05 / rms).min(10.0);
     let mut speech_frames = 0;
     let mut total_frames = 0;
     for frame in audio.chunks_exact(480) {
         let pcm: Vec<i16> = frame
             .iter()
-            .map(|sample| (sample * gain * 32767.0).clamp(-32767.0, 32767.0) as i16)
+            .map(|sample| (sample * 32767.0).clamp(-32767.0, 32767.0) as i16)
             .collect();
         total_frames += 1;
         if vad
