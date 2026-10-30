@@ -29,8 +29,9 @@ use crate::{
 };
 
 const LIVE_SAMPLE_RATE: u32 = 16_000;
-const LIVE_CHUNK_TARGET: Duration = Duration::from_secs(6);
-const LIVE_CHUNK_MIN: Duration = Duration::from_secs(2);
+const LIVE_CHUNK_TARGET: Duration = Duration::from_secs(15);
+const LIVE_CHUNK_MIN: Duration = Duration::from_secs(6);
+const LIVE_END_SILENCE: Duration = Duration::from_millis(750);
 const FLUSH_TICK: Duration = Duration::from_millis(750);
 const MIN_LIVE_RMS: f32 = 0.003;
 
@@ -190,7 +191,7 @@ async fn ingest_loop(
                 }
             }
             _ = flush_tick.tick() => {
-                if buffer.duration() >= LIVE_CHUNK_MIN {
+                if buffer.ready_after_pause() {
                     hand_off(&mut buffer, &mailbox);
                 }
             }
@@ -399,6 +400,7 @@ struct LiveChunkBuffer {
     samples: Vec<f32>,
     first_captured_at_unix_ms: Option<u64>,
     last_captured_at_unix_ms: Option<u64>,
+    trailing_silence_samples: usize,
 }
 
 impl LiveChunkBuffer {
@@ -407,7 +409,20 @@ impl LiveChunkBuffer {
             self.first_captured_at_unix_ms = Some(captured_at_unix_ms);
         }
         self.last_captured_at_unix_ms = Some(captured_at_unix_ms);
+        if rms(&samples) < MIN_LIVE_RMS {
+            self.trailing_silence_samples += samples.len();
+        } else {
+            self.trailing_silence_samples = 0;
+        }
         self.samples.extend(samples);
+    }
+
+    fn ready_after_pause(&self) -> bool {
+        // The timer must not cut continuous speech into independent 2s guesses.
+        self.duration() >= LIVE_CHUNK_MIN
+            && Duration::from_secs_f32(
+                self.trailing_silence_samples as f32 / LIVE_SAMPLE_RATE as f32,
+            ) >= LIVE_END_SILENCE
     }
 
     fn duration(&self) -> Duration {
@@ -419,6 +434,7 @@ impl LiveChunkBuffer {
             return None;
         }
         let samples = std::mem::take(&mut self.samples);
+        self.trailing_silence_samples = 0;
         let captured_at_unix_ms = self
             .first_captured_at_unix_ms
             .take()
@@ -498,6 +514,42 @@ fn emit_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_timer_keeps_continuous_speech_for_context() {
+        let mut buffer = LiveChunkBuffer::default();
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize * 12], 1_000);
+
+        assert!(!buffer.ready_after_pause());
+    }
+
+    #[test]
+    fn live_timer_flushes_a_completed_utterance() {
+        let mut buffer = LiveChunkBuffer::default();
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize * 6], 1_000);
+        buffer.push(vec![0.0; LIVE_SAMPLE_RATE as usize * 3 / 4], 7_000);
+
+        assert!(buffer.ready_after_pause());
+    }
+
+    #[test]
+    fn live_timer_does_not_decode_a_two_second_fragment() {
+        let mut buffer = LiveChunkBuffer::default();
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize * 2], 1_000);
+        buffer.push(vec![0.0; LIVE_SAMPLE_RATE as usize], 3_000);
+
+        assert!(!buffer.ready_after_pause());
+    }
+
+    #[test]
+    fn resumed_speech_cancels_pause_flush() {
+        let mut buffer = LiveChunkBuffer::default();
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize * 6], 1_000);
+        buffer.push(vec![0.0; LIVE_SAMPLE_RATE as usize], 7_000);
+        buffer.push(vec![0.1; LIVE_SAMPLE_RATE as usize], 8_000);
+
+        assert!(!buffer.ready_after_pause());
+    }
 
     #[test]
     fn live_chunk_buffer_flushes_and_resets() {

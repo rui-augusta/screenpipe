@@ -357,6 +357,22 @@ pub async fn process_audio_input(
         return Ok(());
     }
 
+    if matches!(session, TranscriptionSession::Whisper { .. }) {
+        let mut speakers = Vec::new();
+        while let Some(segment) = segments.recv().await {
+            speakers.push(segment);
+        }
+        // Speaker windows are intentionally short. They identify speakers,
+        // not ASR utterances: recognize the original capture once, before
+        // assigning speakers to the resulting timed passages.
+        for result in transcribe_whisper_capture(&audio, &file_path, &speakers, session).await? {
+            if output_sender.send_async(result).await.is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
     while let Some(segment) = segments.recv().await {
         let path = file_path.clone();
         let transcription_result = run_stt(
@@ -379,6 +395,97 @@ pub async fn process_audio_input(
     }
 
     Ok(())
+}
+
+fn passage_embedding(start: f64, end: f64, speakers: &[SpeechSegment]) -> Vec<f32> {
+    use crate::speaker::identify_gate::{
+        MIN_SPEAKER_IDENTIFY_SECS, MIN_SPEAKER_PROFILE_UPDATE_SECS,
+    };
+    // Identity/profile gates must reflect the embedding's speech duration,
+    // not the longer ASR passage to which it is being attached.
+    let minimum = if end - start >= MIN_SPEAKER_PROFILE_UPDATE_SECS {
+        MIN_SPEAKER_PROFILE_UPDATE_SECS
+    } else {
+        MIN_SPEAKER_IDENTIFY_SECS
+    };
+    let mut coverage = std::collections::HashMap::<&str, (f64, &Vec<f32>)>::new();
+    for speaker in speakers
+        .iter()
+        .filter(|speaker| !speaker.embedding.is_empty() && speaker.end - speaker.start >= minimum)
+    {
+        let overlap = (end.min(speaker.end) - start.max(speaker.start)).max(0.0);
+        let entry = coverage
+            .entry(&speaker.speaker)
+            .or_insert((0.0, &speaker.embedding));
+        entry.0 += overlap;
+    }
+    let mut dominant = coverage
+        .into_values()
+        .filter(|(overlap, _)| *overlap > (end - start) / 2.0);
+    match (dominant.next(), dominant.next()) {
+        (Some((_, embedding)), None) => embedding.clone(),
+        _ => Vec::new(), // Mixed/overlapping passages have no reliable single speaker.
+    }
+}
+
+async fn transcribe_whisper_capture(
+    audio: &AudioInput,
+    path: &str,
+    speakers: &[SpeechSegment],
+    session: &mut TranscriptionSession,
+) -> Result<Vec<TranscriptionResult>> {
+    let result = run_stt(
+        SpeechSegment {
+            start: 0.0,
+            end: audio.data.len() as f64 / audio.sample_rate as f64,
+            samples: audio.data.as_ref().clone(),
+            sample_rate: audio.sample_rate,
+            speaker: "unknown".into(),
+            embedding: Vec::new(),
+        },
+        audio.device.clone(),
+        &audio.device.to_string(),
+        path.into(),
+        audio.capture_timestamp,
+        session,
+    )
+    .await?;
+    if result.error.is_some()
+        || result
+            .transcription
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+    {
+        return Ok(vec![result]);
+    }
+    let TranscriptionSession::Whisper {
+        state: Some(state),
+        vocabulary,
+        ..
+    } = session
+    else {
+        return Ok(vec![result]);
+    };
+    let duration = audio.data.len() as f64 / audio.sample_rate as f64;
+    Ok(
+        crate::transcription::whisper::batch::passages(state, vocabulary)
+            .into_iter()
+            .map(|passage| {
+                let start = passage.start.clamp(0.0, duration);
+                let end = passage.end.clamp(start, duration);
+                TranscriptionResult {
+                    input: audio.clone(),
+                    speaker_embedding: passage_embedding(start, end, speakers),
+                    transcription: Some(passage.text),
+                    start_time: start,
+                    end_time: end,
+                    ..result.clone()
+                }
+            })
+            .collect(),
+    )
 }
 
 pub async fn run_stt(
@@ -454,4 +561,173 @@ fn offset_diarization_segments(
     }
 
     output
+}
+
+#[cfg(test)]
+mod capture_context_tests {
+    use super::*;
+
+    fn speaker(start: f64, end: f64, name: &str, embedding: f32) -> SpeechSegment {
+        SpeechSegment {
+            start,
+            end,
+            speaker: name.into(),
+            embedding: vec![embedding],
+            samples: vec![],
+            sample_rate: SAMPLE_RATE,
+        }
+    }
+
+    #[test]
+    fn short_identity_windows_still_label_a_complete_passage() {
+        let speakers = vec![
+            speaker(0.0, 2.0, "a", 1.0),
+            speaker(2.0, 4.0, "a", 1.0),
+            speaker(4.0, 6.0, "a", 1.0),
+        ];
+        assert_eq!(passage_embedding(0.0, 6.0, &speakers), vec![1.0]);
+    }
+
+    #[test]
+    fn an_even_speaker_change_does_not_misattribute_the_passage() {
+        let speakers = vec![speaker(0.0, 3.0, "a", 1.0), speaker(3.0, 6.0, "b", 2.0)];
+        assert!(passage_embedding(0.0, 6.0, &speakers).is_empty());
+    }
+
+    #[test]
+    fn overlapping_speakers_do_not_create_false_certainty() {
+        let speakers = vec![speaker(0.0, 6.0, "a", 1.0), speaker(1.0, 6.0, "b", 2.0)];
+        assert!(passage_embedding(0.0, 6.0, &speakers).is_empty());
+    }
+
+    #[test]
+    fn speaker_outside_the_passage_is_not_assigned() {
+        assert!(passage_embedding(0.0, 2.0, &[speaker(4.0, 6.0, "a", 1.0)]).is_empty());
+    }
+
+    #[test]
+    fn short_embedding_cannot_learn_from_a_longer_asr_passage() {
+        assert!(passage_embedding(0.0, 2.0, &[speaker(0.0, 1.1, "a", 1.0)]).is_empty());
+    }
+
+    #[test]
+    fn match_only_duration_can_still_identify_a_short_passage() {
+        assert_eq!(
+            passage_embedding(0.0, 1.2, &[speaker(0.0, 1.2, "a", 1.0)]),
+            vec![1.0]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "local acceptance: requires cached Whisper model and private recording manifest"]
+    async fn actual_recordings_keep_capture_context() {
+        use crate::transcription::engine::WhisperSharedContext;
+        let model = std::env::var("SCREENPIPE_TEST_WHISPER_MODEL").expect("cached model");
+        let manifest =
+            std::env::var("SCREENPIPE_TEST_RECORDING_MANIFEST").expect("private manifest");
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        let context = Arc::new(
+            whisper_rs::WhisperContext::new_with_params(
+                &model,
+                whisper_rs::WhisperContextParameters::default(),
+            )
+            .unwrap(),
+        );
+        let mut session = TranscriptionSession::Whisper {
+            state: Some(context.create_state().unwrap()),
+            context: Some(context.clone()),
+            shared_context: Arc::new(StdMutex::new(WhisperSharedContext::Ready {
+                context: context.clone(),
+                gpu_active: true,
+            })),
+            config: Arc::new(AudioTranscriptionEngine::WhisperLargeV3TurboQuantized),
+            languages: vec![Language::Portuguese, Language::English],
+            vocabulary: vec![],
+            gpu_recovery_attempted: false,
+        };
+        let segmentation_model = PathBuf::from(
+            std::env::var("SCREENPIPE_TEST_SEGMENTATION_MODEL").expect("cached segmentation model"),
+        );
+        let embedding_model = std::env::var("SCREENPIPE_TEST_EMBEDDING_MODEL")
+            .expect("cached speaker embedding model");
+        let embedding_extractor = Arc::new(StdMutex::new(
+            EmbeddingExtractor::new(embedding_model).unwrap(),
+        ));
+        let embeddings = Arc::new(StdMutex::new(EmbeddingManager::new(usize::MAX)));
+        let vad: Arc<Mutex<Box<dyn VadEngine + Send>>> = Arc::new(Mutex::new(Box::new(
+            crate::vad::silero::SileroVad::new().await.unwrap(),
+        )));
+        let db = screenpipe_db::DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        for case in cases {
+            let path = PathBuf::from(case["path"].as_str().unwrap());
+            let (samples, sample_rate) = crate::utils::ffmpeg::read_audio_from_file(&path).unwrap();
+            let duration = samples.len() as f64 / sample_rate as f64;
+            let audio = AudioInput {
+                data: Arc::new(samples),
+                sample_rate,
+                channels: 1,
+                device: Arc::new(AudioDevice::new(
+                    "recording acceptance".into(),
+                    if case["is_input"].as_bool().unwrap_or(true) {
+                        crate::core::device::DeviceType::Input
+                    } else {
+                        crate::core::device::DeviceType::Output
+                    },
+                )),
+                capture_timestamp: 1,
+            };
+            let (sender, receiver) = flume::bounded(100);
+            // Exercise the production entry point, including real VAD and
+            // diarization. The separate DB and pre-written placeholder ensure
+            // acceptance never changes the user's recordings or history.
+            process_audio_input(
+                audio,
+                vad.clone(),
+                Some(segmentation_model.clone()),
+                embeddings.clone(),
+                Some(embedding_extractor.clone()),
+                &PathBuf::new(),
+                &sender,
+                &mut session,
+                Arc::new(AudioPipelineMetrics::new()),
+                Some("acceptance.mp4".into()),
+                false,
+                &db,
+            )
+            .await
+            .unwrap();
+            let results = receiver.try_iter().collect::<Vec<_>>();
+            assert!(results.iter().all(|r| r.error.is_none()));
+            let text = results
+                .iter()
+                .filter_map(|r| r.transcription.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            eprintln!("ACTUAL_RECORDING {}: {}", case["label"], text);
+            for keyword in case["keywords"].as_array().unwrap() {
+                assert!(
+                    text.contains(keyword.as_str().unwrap()),
+                    "{} missing {}: {}",
+                    case["label"],
+                    keyword,
+                    text
+                );
+            }
+            if let Some(max_words) = case["max_words"].as_u64() {
+                assert!(
+                    text.split_whitespace().count() <= max_words as usize,
+                    "{}: {}",
+                    case["label"],
+                    text
+                );
+            }
+            assert!(results
+                .iter()
+                .all(|r| r.start_time >= 0.0 && r.end_time <= duration));
+        }
+    }
 }

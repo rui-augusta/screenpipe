@@ -9,12 +9,112 @@ use screenpipe_core::Language;
 use tracing::debug;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperState};
 
-/// Minimum RMS energy threshold for audio to be worth transcribing.
-/// Below this, the audio is near-silent and Whisper tends to hallucinate
-/// phantom text like "Thank you." or "So, let's go."
-/// Value calibrated against: silence (RMS=0.0), ambient noise at 0.01 amplitude (RMS~0.007),
-/// white noise at 0.1 amplitude (RMS~0.071), normal speech (RMS~0.05-0.3).
-const MIN_RMS_ENERGY: f32 = 0.015;
+const MIN_RMS_ENERGY: f32 = 0.003;
+const QUIET_RMS_ENERGY: f32 = 0.015;
+
+pub(crate) struct WhisperPassage {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+pub(crate) fn passages(
+    state: &WhisperState,
+    vocabulary: &[VocabularyEntry],
+) -> Vec<WhisperPassage> {
+    let mut passages = (0..state.full_n_segments())
+        .filter_map(|index| {
+            let segment = state.get_segment(index)?;
+            if segment.no_speech_probability() > 0.6 {
+                return None;
+            }
+            Some(WhisperPassage {
+                text: segment.to_str().ok()?.to_owned(),
+                start: segment.start_timestamp() as f64 / 100.0,
+                end: segment.end_timestamp() as f64 / 100.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    replace_passage_vocabulary(&mut passages, vocabulary);
+    passages
+}
+
+fn replace_passage_vocabulary(passages: &mut Vec<WhisperPassage>, vocabulary: &[VocabularyEntry]) {
+    for entry in vocabulary {
+        let Some(replacement) = &entry.replacement else {
+            continue;
+        };
+        let text = passages.iter().map(|p| p.text.as_str()).collect::<String>();
+        // Merge passages crossed by a phrase replacement without losing its words.
+        for (offset, matched) in text
+            .match_indices(&entry.word)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let mut position = 0;
+            let mut first = None;
+            let mut last = None;
+            for (index, passage) in passages.iter().enumerate() {
+                let end = position + passage.text.len();
+                if position <= offset && offset < end {
+                    first = Some(index);
+                }
+                if position < offset + matched.len() && offset + matched.len() <= end {
+                    last = Some(index);
+                }
+                position = end;
+            }
+            if let (Some(first), Some(last)) = (first, last) {
+                if first < last {
+                    passages[first].text = passages[first..=last]
+                        .iter()
+                        .map(|p| p.text.as_str())
+                        .collect();
+                    passages[first].end = passages[last].end;
+                    passages.drain(first + 1..=last);
+                }
+            }
+        }
+        for passage in passages.iter_mut() {
+            passage.text = passage.text.replace(&entry.word, replacement);
+        }
+    }
+}
+
+fn has_transcribable_audio(audio: &[f32]) -> Result<bool> {
+    if audio.is_empty() {
+        return Ok(false);
+    }
+    let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+    if rms < MIN_RMS_ENERGY {
+        return Ok(false);
+    }
+    if rms >= QUIET_RMS_ENERGY {
+        return Ok(true);
+    }
+
+    // Quiet speech and room noise share the same RMS range. Use the existing
+    // local WebRTC detector rather than discarding both or amplifying noise.
+    let mut vad = webrtc_vad::Vad::new_with_rate(webrtc_vad::SampleRate::Rate16kHz);
+    vad.set_mode(webrtc_vad::VadMode::Aggressive);
+    let mut speech_frames = 0;
+    let mut total_frames = 0;
+    for frame in audio.chunks_exact(480) {
+        let pcm: Vec<i16> = frame
+            .iter()
+            .map(|sample| (sample * 32767.0).clamp(-32767.0, 32767.0) as i16)
+            .collect();
+        total_frames += 1;
+        if vad
+            .is_voice_segment(&pcm)
+            .map_err(|error| anyhow::anyhow!("Whisper speech detection: {error:?}"))?
+        {
+            speech_frames += 1;
+        }
+    }
+    Ok(speech_frames >= 10 && speech_frames * 50 >= total_frames)
+}
 
 /// Char budget for the Whisper initial_prompt — roughly Whisper's ~224-token
 /// prompt window. Entries past this are dropped (whole entries only).
@@ -60,15 +160,8 @@ pub async fn process_with_whisper(
     whisper_state: &mut WhisperState,
     vocabulary: &[VocabularyEntry],
 ) -> Result<String> {
-    // Pre-check: if audio energy is too low, skip transcription entirely.
-    // Whisper hallucinates on silence/near-silence (e.g. "Thank you.", "So, let's go.")
-    // and its internal no_speech_prob is unreliable (reports 0.0 on pure silence).
-    let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
-    if rms < MIN_RMS_ENERGY {
-        debug!(
-            "audio RMS {:.6} below threshold {:.6}, skipping whisper",
-            rms, MIN_RMS_ENERGY
-        );
+    if !has_transcribable_audio(audio)? {
+        debug!("no audible speech detected, skipping whisper");
         return Ok(String::new());
     }
 
@@ -135,24 +228,151 @@ fn transcribe_sync(
         .full(params, &audio)
         .map_err(|e| anyhow::anyhow!("failed to run whisper model: {}", e))?;
 
-    let num_segments = whisper_state.full_n_segments();
-
-    let mut transcript = String::new();
-
-    for i in 0..num_segments {
-        if let Some(segment) = whisper_state.get_segment(i) {
-            if let Ok(text) = segment.to_str() {
-                transcript.push_str(text);
-            }
-        }
-    }
-
-    Ok(transcript)
+    // A strong no-speech prediction must not turn room noise into words.
+    // Vocabulary replacement remains owned by TranscriptionSession.
+    Ok(passages(whisper_state, &[])
+        .into_iter()
+        .map(|p| p.text)
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabulary_phrase_crossing_a_passage_keeps_words_and_timing() {
+        let mut passages = vec![
+            WhisperPassage {
+                text: "Visit São".into(),
+                start: 1.0,
+                end: 2.0,
+            },
+            WhisperPassage {
+                text: " Paulo tomorrow.".into(),
+                start: 2.0,
+                end: 4.0,
+            },
+        ];
+        replace_passage_vocabulary(
+            &mut passages,
+            &[VocabularyEntry {
+                word: "São Paulo".into(),
+                replacement: Some("SP".into()),
+            }],
+        );
+        assert_eq!(passages.len(), 1);
+        assert_eq!(passages[0].text, "Visit SP tomorrow.");
+        assert_eq!((passages[0].start, passages[0].end), (1.0, 4.0));
+    }
+
+    #[test]
+    fn vocabulary_within_a_passage_keeps_other_boundaries() {
+        let mut passages = vec![
+            WhisperPassage {
+                text: "Hello Rui.".into(),
+                start: 0.0,
+                end: 2.0,
+            },
+            WhisperPassage {
+                text: " Hello.".into(),
+                start: 2.0,
+                end: 3.0,
+            },
+        ];
+        replace_passage_vocabulary(
+            &mut passages,
+            &[VocabularyEntry {
+                word: "Rui".into(),
+                replacement: Some("RUI".into()),
+            }],
+        );
+        assert_eq!(passages.len(), 2);
+        assert_eq!(passages[0].text, "Hello RUI.");
+        assert_eq!((passages[1].start, passages[1].end), (2.0, 3.0));
+    }
+
+    #[test]
+    fn whisper_rejects_empty_audio_and_silence() {
+        assert!(!has_transcribable_audio(&[]).unwrap());
+        assert!(!has_transcribable_audio(&vec![0.0; 16000]).unwrap());
+    }
+
+    #[test]
+    fn whisper_rejects_quiet_stationary_noise() {
+        let mut seed = 1_u32;
+        let noise: Vec<f32> = (0..16000 * 6)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((seed >> 16) as f32 / 65535.0 - 0.5) * 0.02
+            })
+            .collect();
+
+        assert!(!has_transcribable_audio(&noise).unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a cached model and locally generated bilingual fixtures"]
+    async fn offline_portuguese_english_recordings() {
+        let model = std::env::var("SCREENPIPE_TEST_WHISPER_MODEL").expect("local model path");
+        let fixtures = std::path::PathBuf::from(
+            std::env::var("SCREENPIPE_TEST_AUDIO_FIXTURES").expect("local fixture directory"),
+        );
+        let context = whisper_rs::WhisperContext::new_with_params(
+            &model,
+            whisper_rs::WhisperContextParameters::default(),
+        )
+        .expect("cached Whisper model");
+        let mut state = context.create_state().unwrap();
+
+        // Reuse the session in alternating languages; neither language may lock
+        // the next passage to itself. Quiet files contain the same known speech.
+        for (file, keywords) in [
+            (
+                "portuguese.wav",
+                ["reunião", "preços", "proposta", "cliente", "internet"],
+            ),
+            (
+                "english.wav",
+                ["report", "meeting", "prices", "proposal", "internet"],
+            ),
+            (
+                "portuguese-quiet.wav",
+                ["reunião", "preços", "proposta", "cliente", "internet"],
+            ),
+            (
+                "english-quiet.wav",
+                ["report", "meeting", "prices", "proposal", "internet"],
+            ),
+        ] {
+            let (audio, rate) =
+                crate::utils::ffmpeg::read_audio_from_file(&fixtures.join(file)).unwrap();
+            assert_eq!(rate, 16000);
+            assert!(
+                has_transcribable_audio(&audio).unwrap(),
+                "speech rejected: {file}"
+            );
+            let mut text = String::new();
+            for chunk in audio.chunks(16000 * 15) {
+                text.push_str(
+                    &process_with_whisper(
+                        chunk,
+                        vec![Language::Portuguese, Language::English],
+                        &mut state,
+                        &[],
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            let text = text.to_lowercase();
+            let hits = keywords.iter().filter(|word| text.contains(**word)).count();
+            assert!(
+                hits >= 4,
+                "{file}: only {hits}/5 key words recovered: {text}"
+            );
+        }
+    }
 
     /// Guard mechanics on a dedicated thread (never mutate the test runner's
     /// worker threads): dips to BELOW_NORMAL while held, restores on drop,
