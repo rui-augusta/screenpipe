@@ -12,6 +12,76 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperState};
 const MIN_RMS_ENERGY: f32 = 0.003;
 const QUIET_RMS_ENERGY: f32 = 0.015;
 
+pub(crate) struct WhisperPassage {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+pub(crate) fn passages(
+    state: &WhisperState,
+    vocabulary: &[VocabularyEntry],
+) -> Vec<WhisperPassage> {
+    let mut passages = (0..state.full_n_segments())
+        .filter_map(|index| {
+            let segment = state.get_segment(index)?;
+            if segment.no_speech_probability() > 0.6 {
+                return None;
+            }
+            Some(WhisperPassage {
+                text: segment.to_str().ok()?.to_owned(),
+                start: segment.start_timestamp() as f64 / 100.0,
+                end: segment.end_timestamp() as f64 / 100.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    replace_passage_vocabulary(&mut passages, vocabulary);
+    passages
+}
+
+fn replace_passage_vocabulary(passages: &mut Vec<WhisperPassage>, vocabulary: &[VocabularyEntry]) {
+    for entry in vocabulary {
+        let Some(replacement) = &entry.replacement else {
+            continue;
+        };
+        let text = passages.iter().map(|p| p.text.as_str()).collect::<String>();
+        // Merge passages crossed by a phrase replacement without losing its words.
+        for (offset, matched) in text
+            .match_indices(&entry.word)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            let mut position = 0;
+            let mut first = None;
+            let mut last = None;
+            for (index, passage) in passages.iter().enumerate() {
+                let end = position + passage.text.len();
+                if position <= offset && offset < end {
+                    first = Some(index);
+                }
+                if position < offset + matched.len() && offset + matched.len() <= end {
+                    last = Some(index);
+                }
+                position = end;
+            }
+            if let (Some(first), Some(last)) = (first, last) {
+                if first < last {
+                    passages[first].text = passages[first..=last]
+                        .iter()
+                        .map(|p| p.text.as_str())
+                        .collect();
+                    passages[first].end = passages[last].end;
+                    passages.drain(first + 1..=last);
+                }
+            }
+        }
+        for passage in passages.iter_mut() {
+            passage.text = passage.text.replace(&entry.word, replacement);
+        }
+    }
+}
+
 fn has_transcribable_audio(audio: &[f32]) -> Result<bool> {
     if audio.is_empty() {
         return Ok(false);
@@ -158,24 +228,69 @@ fn transcribe_sync(
         .full(params, &audio)
         .map_err(|e| anyhow::anyhow!("failed to run whisper model: {}", e))?;
 
-    let num_segments = whisper_state.full_n_segments();
-
-    let mut transcript = String::new();
-
-    for i in 0..num_segments {
-        if let Some(segment) = whisper_state.get_segment(i) {
-            if let Ok(text) = segment.to_str() {
-                transcript.push_str(text);
-            }
-        }
-    }
-
-    Ok(transcript)
+    // A strong no-speech prediction must not turn room noise into words.
+    // Vocabulary replacement remains owned by TranscriptionSession.
+    Ok(passages(whisper_state, &[])
+        .into_iter()
+        .map(|p| p.text)
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocabulary_phrase_crossing_a_passage_keeps_words_and_timing() {
+        let mut passages = vec![
+            WhisperPassage {
+                text: "Visit São".into(),
+                start: 1.0,
+                end: 2.0,
+            },
+            WhisperPassage {
+                text: " Paulo tomorrow.".into(),
+                start: 2.0,
+                end: 4.0,
+            },
+        ];
+        replace_passage_vocabulary(
+            &mut passages,
+            &[VocabularyEntry {
+                word: "São Paulo".into(),
+                replacement: Some("SP".into()),
+            }],
+        );
+        assert_eq!(passages.len(), 1);
+        assert_eq!(passages[0].text, "Visit SP tomorrow.");
+        assert_eq!((passages[0].start, passages[0].end), (1.0, 4.0));
+    }
+
+    #[test]
+    fn vocabulary_within_a_passage_keeps_other_boundaries() {
+        let mut passages = vec![
+            WhisperPassage {
+                text: "Hello Rui.".into(),
+                start: 0.0,
+                end: 2.0,
+            },
+            WhisperPassage {
+                text: " Hello.".into(),
+                start: 2.0,
+                end: 3.0,
+            },
+        ];
+        replace_passage_vocabulary(
+            &mut passages,
+            &[VocabularyEntry {
+                word: "Rui".into(),
+                replacement: Some("RUI".into()),
+            }],
+        );
+        assert_eq!(passages.len(), 2);
+        assert_eq!(passages[0].text, "Hello RUI.");
+        assert_eq!((passages[1].start, passages[1].end), (2.0, 3.0));
+    }
 
     #[test]
     fn whisper_rejects_empty_audio_and_silence() {
